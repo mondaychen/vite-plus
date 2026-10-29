@@ -291,16 +291,27 @@ fn check_npm_global_install_result(
                     if config.source == BinSource::Vp {
                         // Managed by vp install -g — warn about the conflict
                         managed_conflicts.push((bin_name, config.package.clone()));
-                    } else if config.source == BinSource::Npm && config.package != package_name {
-                        // Link exists from a different npm package — recreate link for new owner.
-                        // The old symlink points at the previous package's binary; we must
-                        // replace it so it resolves to the new package's binary in npm's bin dir.
+                    } else if config.source == BinSource::Npm {
+                        // Recreate the link when a different npm package now owns the binary,
+                        // or when a reinstall under another Node.js version put the binary
+                        // in a different npm bin dir. Otherwise the link keeps launching the
+                        // previous binary.
                         #[cfg(unix)]
                         let source_path = npm_bin_dir.join(&bin_name);
                         #[cfg(windows)]
                         let source_path = npm_bin_dir.join(vt_str::format!("{bin_name}.cmd"));
 
-                        if source_path.as_path().exists() {
+                        let same_owner = config.package == package_name;
+                        if source_path.as_path().exists()
+                            && !(same_owner
+                                && npm_bin_link_targets(&bin_dir, &bin_name, &source_path))
+                        {
+                            if same_owner && config.node_version != node_version {
+                                output::note(&vt_str::format!(
+                                    "Moving '{bin_name}' from Node.js {} to {node_version}",
+                                    config.node_version
+                                ));
+                            }
                             let _ = std::fs::remove_file(shim_path.as_path());
                             create_bin_link(
                                 &bin_dir,
@@ -421,6 +432,27 @@ fn link_missing_npm_bins(
         if source_path.as_path().exists() {
             create_bin_link(bin_dir, bin_name, source_path, package_name, node_version);
         }
+    }
+}
+
+/// Whether the existing npm bin link in `bin_dir` launches `source_path`.
+fn npm_bin_link_targets(
+    bin_dir: &AbsolutePath,
+    bin_name: &str,
+    source_path: &AbsolutePath,
+) -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::read_link(bin_dir.join(bin_name).as_path())
+            .is_ok_and(|target| target == source_path.as_path())
+    }
+
+    #[cfg(windows)]
+    {
+        // `create_bin_link` writes the quoted source path into the `.cmd` wrapper.
+        let quoted_source = vt_str::format!("\"{}\"", source_path.as_path().display());
+        std::fs::read_to_string(bin_dir.join(vt_str::format!("{bin_name}.cmd")).as_path())
+            .is_ok_and(|content| content.contains(quoted_source.as_str()))
     }
 }
 
@@ -1922,6 +1954,52 @@ mod tests {
             link_missing_npm_bins(&bin_dir, &candidates, "22.18.0");
             assert_eq!(BinConfig::load_sync("test-cli").unwrap().unwrap().package, "npm-package");
             assert!(bin_dir.join("test-cli").as_path().exists());
+        });
+    }
+
+    #[test]
+    fn test_npm_reinstall_under_new_node_version_moves_link() {
+        let temp = TempDir::new().unwrap();
+        // One npm prefix per Node.js version, as with Vite+-managed runtimes.
+        let install = |version: &str| {
+            let prefix = AbsolutePathBuf::new(temp.path().join("node").join(version)).unwrap();
+            let package_dir = prefix.join("lib").join("node_modules").join("test-package");
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::write(
+                package_dir.join("package.json"),
+                r#"{"name":"test-package","bin":{"test-cli":"cli.js"}}"#,
+            )
+            .unwrap();
+            #[cfg(unix)]
+            let source = prefix.join("bin").join("test-cli");
+            #[cfg(windows)]
+            let source = prefix.join("test-cli.cmd");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, "").unwrap();
+            (prefix, source)
+        };
+        let (_, old_source) = install("22.18.0");
+        let (new_prefix, new_source) = install("24.11.0");
+
+        vp_shared::EnvConfig::with_vars([(env_vars::VP_HOME, temp.path())], |_| {
+            let bin_dir = config::get_bin_dir().unwrap();
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            create_bin_link(&bin_dir, "test-cli", &old_source, "test-package", "22.18.0");
+            assert!(npm_bin_link_targets(&bin_dir, "test-cli", &old_source));
+
+            let packages = s(&["test-package"]);
+            check_npm_global_install_result(&packages, None, &new_prefix, &new_prefix, "24.11.0");
+            assert!(npm_bin_link_targets(&bin_dir, "test-cli", &new_source));
+            assert!(!npm_bin_link_targets(&bin_dir, "test-cli", &old_source));
+            let config = BinConfig::load_sync("test-cli").unwrap().unwrap();
+            assert_eq!(config.package, "test-package");
+            assert_eq!(config.node_version, "24.11.0");
+
+            // A repeat install under the same Node.js version keeps the link as is.
+            let metadata = std::fs::read(BinConfig::path("test-cli").unwrap()).unwrap();
+            check_npm_global_install_result(&packages, None, &new_prefix, &new_prefix, "24.11.0");
+            assert!(npm_bin_link_targets(&bin_dir, "test-cli", &new_source));
+            assert_eq!(std::fs::read(BinConfig::path("test-cli").unwrap()).unwrap(), metadata);
         });
     }
 
