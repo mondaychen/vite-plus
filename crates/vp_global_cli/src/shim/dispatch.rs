@@ -205,6 +205,51 @@ fn get_npm_global_prefix(
     node_dir.clone()
 }
 
+/// Whether npm's effective `dry-run` setting is enabled for this command.
+///
+/// A CLI flag wins. Otherwise `npm config get dry-run` reports the value from
+/// the environment and `.npmrc`. If npm cannot report it, assume a real install.
+fn npm_dry_run_enabled(args: &[String], npm_path: &AbsolutePath, env: &ToolPathEnv) -> bool {
+    if let Some(dry_run) = npm_dry_run_from_args(args) {
+        return dry_run;
+    }
+    std::process::Command::new(npm_path.as_path())
+        .args(["config", "get", "dry-run"])
+        .envs(env.clone().into_envs())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| std::str::from_utf8(&output.stdout).ok().map(npm_config_bool))
+        .unwrap_or(false)
+}
+
+/// The last `--dry-run`, `--dry-run=<value>`, or `--no-dry-run` flag before `--`.
+fn npm_dry_run_from_args(args: &[String]) -> Option<bool> {
+    let mut dry_run = None;
+    for arg in args.iter().take_while(|arg| *arg != "--") {
+        if arg == "--dry-run" {
+            dry_run = Some(true);
+        } else if arg == "--no-dry-run" {
+            dry_run = Some(false);
+        } else if let Some(value) = arg.strip_prefix("--dry-run=") {
+            dry_run = Some(npm_config_bool(value));
+        }
+    }
+    dry_run
+}
+
+/// Parse a boolean npm config value the way npm's option parser (nopt) does:
+/// numbers are true when nonzero, `false` and `null` are false, and any other
+/// string is true. `npm config get` prints environment values unparsed, such
+/// as `1` for `NPM_CONFIG_DRY_RUN=1`.
+fn npm_config_bool(value: &str) -> bool {
+    let value = value.trim();
+    if let Ok(number) = value.parse::<f64>() {
+        return number != 0.0;
+    }
+    !value.is_empty() && value != "false" && value != "null"
+}
+
 /// After npm install -g completes, check if installed binaries are on PATH.
 ///
 /// First determines the actual npm global bin directory (which may differ from the
@@ -948,7 +993,8 @@ pub async fn dispatch(tool: &str, args: &[String], env: ToolPathEnv) -> i32 {
     if tool == "npm" {
         if let Some(parsed) = parse_npm_global_install(args) {
             let exit_code = exec::spawn_tool(&tool_path, args, child_env.clone());
-            if exit_code == 0 {
+            // A dry run changes no files in the npm prefix, so the links stay as they are.
+            if exit_code == 0 && !npm_dry_run_enabled(args, &tool_path, &child_env) {
                 let node_dir = node_prefix_from_binary(&node_path);
                 let node_version = resolution.as_ref().map_or_else(
                     || read_node_version(&node_path).unwrap_or_else(|| "unknown".into()),
@@ -1955,6 +2001,31 @@ mod tests {
             assert_eq!(BinConfig::load_sync("test-cli").unwrap().unwrap().package, "npm-package");
             assert!(bin_dir.join("test-cli").as_path().exists());
         });
+    }
+
+    #[test]
+    fn test_npm_dry_run_from_args() {
+        assert_eq!(npm_dry_run_from_args(&s(&["install", "-g", "pkg"])), None);
+        assert_eq!(npm_dry_run_from_args(&s(&["install", "-g", "--dry-run", "pkg"])), Some(true));
+        assert_eq!(npm_dry_run_from_args(&s(&["i", "-g", "pkg", "--dry-run=false"])), Some(false));
+        assert_eq!(npm_dry_run_from_args(&s(&["i", "-g", "--dry-run=1", "pkg"])), Some(true));
+        // The last flag wins, as in npm.
+        assert_eq!(
+            npm_dry_run_from_args(&s(&["i", "-g", "--dry-run", "--no-dry-run", "pkg"])),
+            Some(false)
+        );
+        // Arguments after `--` are not npm flags.
+        assert_eq!(npm_dry_run_from_args(&s(&["i", "-g", "pkg", "--", "--dry-run"])), None);
+    }
+
+    #[test]
+    fn test_npm_config_bool() {
+        for value in ["true", "1", "yes", "true\n"] {
+            assert!(npm_config_bool(value), "{value:?} should be true");
+        }
+        for value in ["false", "0", "null", "", "false\n"] {
+            assert!(!npm_config_bool(value), "{value:?} should be false");
+        }
     }
 
     #[test]
